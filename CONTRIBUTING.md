@@ -42,6 +42,14 @@ reject shares for stale jobs.
 * A blank line, then a body wrapped at 72 characters that starts with
   "Problem:" and follows with "Solution:".
 
+## Consensus changes
+
+A change to a share chain consensus rule (share validity, proof of
+work, difficulty, uncles, chain work, or payout distribution) starts
+with a written specification in an issue, not with a patch. The patch
+is merged only after the specification reaches consensus, as defined
+in section 2.8 of [docs/C4.md](docs/C4.md).
+
 ## Before sending a pull request
 
 All of these must pass:
@@ -52,3 +60,6 @@ cargo nextest run --workspace
 cargo clippy --workspace --all-targets
 cargo fmt --all -- --check
 ```
+
+Your patch must not lower the project's test coverage as measured by
+CI. Add tests for the code you add or change.
