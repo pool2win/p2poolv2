@@ -12,6 +12,19 @@ patch.
 ## Issues
 
 Describe the problem you face or observe, not the solution you want.
+
+Good ways to describe an issue:
+
+- ✅ Wallets cannot fetch a transaction by its txid from the P2Poolv2
+  Electrum server (`blockchain.transaction.get` is not implemented)
+- ✅ Share chain transactions cannot be sent or received, because
+  they cannot be serialized or deserialized
+
+Bad ways to describe an issue:
+
+- ❌ Add the `blockchain.transaction.get` method
+- ❌ Add serde for share chain transactions
+
 Feature requests and ideas that do not state a provable problem will be
 closed.
 
