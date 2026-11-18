@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::accounting::OutputPair;
-use crate::config::StratumConfig;
+use crate::config::{MAX_CUT_BASIS_POINTS, StratumConfig};
 #[cfg(test)]
 #[mockall_double::double]
 use crate::shares::chain::chain_store_handle::ChainStoreHandle;
@@ -68,13 +68,13 @@ pub trait PayoutDistribution {
             total_amount,
             &config.donation_address_parsed,
             config.donation,
-        );
+        )?;
         let remaining_total_amount = include_address_and_cut(
             &mut distribution,
             remaining_total_amount,
             &config.fee_address_parsed,
             config.fee,
-        );
+        )?;
 
         self.fill_distribution_from_shares(
             &mut distribution,
@@ -89,49 +89,38 @@ pub trait PayoutDistribution {
     }
 }
 
-/// Maximum donation or fee cut, in basis points (100%).
-pub(crate) const MAX_CUT_BASIS_POINTS: u16 = 10_000;
-
-/// Appends new output pair to distribution and returns remaining amount
+/// Appends the cut's output pair to distribution and returns the remaining amount.
+///
+/// `cut` is in basis points of `total_amount`. A missing or zero cut, or a
+/// missing address, appends nothing and returns `total_amount` unchanged.
+///
+/// Returns an error for a cut above `MAX_CUT_BASIS_POINTS` (100%), which
+/// would take more than `total_amount`.
 pub(crate) fn include_address_and_cut(
     distribution: &mut Vec<OutputPair>,
     total_amount: bitcoin::Amount,
     address: &Option<Address>,
-    cut: Option<u16>, // in basis points
-) -> Amount {
-    const BASIS_POINT_FACTOR: u64 = MAX_CUT_BASIS_POINTS as u64; // 100 * 100
-
-    // An over-100% cut would make the payout subtraction underflow. Ignore it
-    // here as well as rejecting it during header validation, so every caller
-    // remains panic-free.
-    if let Some(cut_bp) = cut.filter(|c| *c > MAX_CUT_BASIS_POINTS) {
-        tracing::warn!("Ignoring cut of {cut_bp} basis points; maximum is {MAX_CUT_BASIS_POINTS}");
-        return total_amount;
+    cut: Option<u16>,
+) -> Result<Amount, Box<dyn Error + Send + Sync>> {
+    if let Some(cut_basis_points) = cut.filter(|cut| *cut > MAX_CUT_BASIS_POINTS) {
+        return Err(format!(
+            "cut of {cut_basis_points} basis points exceeds {MAX_CUT_BASIS_POINTS} basis points"
+        )
+        .into());
     }
-
-    if let (Some(addr), Some(cut_bp)) = (address.as_ref(), cut.filter(|c| *c > 0)) {
-        if let Some(amount) = total_amount.checked_mul(cut_bp.into()) {
-            if let Some(div_amount) = amount.checked_div(BASIS_POINT_FACTOR) {
-                if let Some(remaining) = total_amount.checked_sub(div_amount) {
-                    distribution.push(OutputPair {
-                        address: addr.clone(),
-                        amount: div_amount,
-                    });
-                    return remaining;
-                }
-                tracing::warn!(
-                    "checked_sub failed for total_amount: {total_amount:?}, div_amount: {div_amount:?}"
-                );
-            } else {
-                tracing::warn!("checked_div failed for amount: {amount:?}");
-            }
-        } else {
-            tracing::warn!(
-                "checked_mul failed for total_amount: {total_amount:?}, cut_bp: {cut_bp:?}"
-            );
-        }
-    }
-    total_amount
+    let (Some(address), Some(cut_basis_points)) = (address.as_ref(), cut.filter(|cut| *cut > 0))
+    else {
+        return Ok(total_amount);
+    };
+    //* Compute in u128 to avoid overflow near MAX_MONEY; a cut of at most 100% keeps it within total_amount
+    let cut_sats = u128::from(total_amount.to_sat()) * u128::from(cut_basis_points)
+        / u128::from(MAX_CUT_BASIS_POINTS);
+    let cut_amount = Amount::from_sat(cut_sats as u64);
+    distribution.push(OutputPair {
+        address: address.clone(),
+        amount: cut_amount,
+    });
+    Ok(total_amount - cut_amount)
 }
 
 /// Appends proportional distribution of amount based on difficulty weights to the distribution.
@@ -250,34 +239,98 @@ mod tests {
     }
 
     #[test]
-    fn test_include_address_and_cut_ignores_cuts_above_maximum() {
+    fn test_include_address_and_cut_rejects_cut_just_above_maximum() {
         let address = Some(parse_address_from_string(
             "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
         ));
-        let total_amount = Amount::from_sat(100_000_000);
+        let mut distribution = Vec::with_capacity(1);
 
-        for cut in [10_001, u16::MAX] {
-            let mut distribution = Vec::new();
-            let remaining =
-                include_address_and_cut(&mut distribution, total_amount, &address, Some(cut));
+        let error = include_address_and_cut(
+            &mut distribution,
+            Amount::from_sat(100_000_000),
+            &address,
+            Some(10_001),
+        )
+        .unwrap_err();
 
-            assert_eq!(remaining, total_amount);
-            assert!(distribution.is_empty());
-        }
+        assert!(
+            error.to_string().contains("10001 basis points"),
+            "got: {error}"
+        );
+        assert!(distribution.is_empty());
+    }
+
+    #[test]
+    fn test_include_address_and_cut_rejects_largest_cut() {
+        let address = Some(parse_address_from_string(
+            "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
+        ));
+        let mut distribution = Vec::with_capacity(1);
+
+        let error = include_address_and_cut(
+            &mut distribution,
+            Amount::from_sat(100_000_000),
+            &address,
+            Some(u16::MAX),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("65535 basis points"),
+            "got: {error}"
+        );
+        assert!(distribution.is_empty());
+    }
+
+    #[test]
+    fn test_include_address_and_cut_rejects_cut_above_maximum_without_address() {
+        let mut distribution = Vec::with_capacity(1);
+
+        let result = include_address_and_cut(
+            &mut distribution,
+            Amount::from_sat(100_000_000),
+            &None,
+            Some(10_001),
+        );
+
+        assert!(result.is_err());
+        assert!(distribution.is_empty());
+    }
+
+    /// MAX_MONEY times the cut overflows u64, so the cut is computed in u128.
+    #[test]
+    fn test_include_address_and_cut_takes_full_cut_of_max_money() {
+        let address = parse_address_from_string("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq");
+        let mut distribution = Vec::with_capacity(1);
+
+        let remaining = include_address_and_cut(
+            &mut distribution,
+            Amount::MAX_MONEY,
+            &Some(address.clone()),
+            Some(5_000),
+        )
+        .unwrap();
+
+        assert_eq!(
+            distribution[0].amount,
+            Amount::from_sat(1_050_000_000_000_000)
+        );
+        assert_eq!(remaining, Amount::from_sat(1_050_000_000_000_000));
     }
 
     #[test]
     fn test_include_address_and_cut_allows_one_hundred_percent() {
         let address = parse_address_from_string("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq");
         let total_amount = Amount::from_sat(100_000_000);
-        let mut distribution = Vec::new();
+        let mut distribution = Vec::with_capacity(1);
 
         let remaining = include_address_and_cut(
             &mut distribution,
             total_amount,
             &Some(address.clone()),
             Some(10_000),
-        );
+        )
+        .unwrap();
 
         assert_eq!(remaining, Amount::ZERO);
         assert_eq!(distribution.len(), 1);

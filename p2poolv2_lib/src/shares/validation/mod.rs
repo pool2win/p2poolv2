@@ -7,7 +7,7 @@ mod bitcoin_block_validation;
 use super::share_block::{MAX_POOL_TARGET, ShareHeader};
 use crate::accounting::OutputPair;
 use crate::accounting::payout::payout_distribution::{
-    MAX_CUT_BASIS_POINTS, append_proportional_distribution, include_address_and_cut,
+    append_proportional_distribution, include_address_and_cut,
 };
 #[cfg(test)]
 #[mockall_double::double]
@@ -17,6 +17,7 @@ use crate::accounting::payout::sharechain_pplns::PplnsWindow;
 use crate::accounting::payout::sharechain_pplns::pplns_window::{
     COINBASE_MATURITY, PAYOUT_DEPTH, WindowError,
 };
+use crate::config::MAX_CUT_BASIS_POINTS;
 #[cfg(test)]
 #[mockall_double::double]
 use crate::pool_difficulty::PoolDifficulty;
@@ -346,7 +347,8 @@ pub trait ShareValidator {
 
     /// Validate a share header meets minimum pool difficulty without requiring parent.
     ///
-    /// Checks uncle count, that header's meets the header's own
+    /// Checks that donation and fee are at most MAX_CUT_BASIS_POINTS, the
+    /// miner address, uncle count, that header's meets the header's own
     /// declared bits target, and that the declared target is no easier than
     /// MAX_POOL_TARGET. This is the anti-spam gate for header sync and broadcast
     /// validation -- cheap and requires no store lookups.
@@ -993,33 +995,37 @@ impl DefaultShareValidator {
         }
     }
 
+    /// Reject a header whose donation or fee is above MAX_CUT_BASIS_POINTS.
+    ///
     /// Donation and fee are basis points, so values above 10_000 exceed 100%
     /// and cannot be used in payout arithmetic.
     fn validate_donation_and_fee(share_header: &ShareHeader) -> Result<(), ValidationError> {
-        for (field, cut) in [
-            ("donation", share_header.donation),
-            ("fee", share_header.fee),
-        ] {
-            if let Some(value) = cut.filter(|cut| *cut > MAX_CUT_BASIS_POINTS) {
-                return Err(ValidationError::consensus(format!(
-                    "Share header {field} {value} exceeds {MAX_CUT_BASIS_POINTS} basis points"
-                )));
-            }
+        if let Some(donation) = share_header
+            .donation
+            .filter(|donation| *donation > MAX_CUT_BASIS_POINTS)
+        {
+            return Err(ValidationError::consensus(format!(
+                "Share header donation {donation} exceeds {MAX_CUT_BASIS_POINTS} basis points"
+            )));
+        }
+        if let Some(fee) = share_header.fee.filter(|fee| *fee > MAX_CUT_BASIS_POINTS) {
+            return Err(ValidationError::consensus(format!(
+                "Share header fee {fee} exceeds {MAX_CUT_BASIS_POINTS} basis points"
+            )));
         }
         Ok(())
     }
 
     /// Build the expected payout outputs from share header donation/fee and PPLNS distribution.
     ///
-    /// When the PPLNS window is empty (bootstrap phase), returns an error.
+    /// Returns a consensus error when the PPLNS window is empty (bootstrap
+    /// phase), or when donation or fee exceeds MAX_CUT_BASIS_POINTS. A share
+    /// stored before the header gate rejected such cuts fails here.
     fn build_expected_outputs(
         share_header: &ShareHeader,
         address_difficulty_map: &HashMap<Address, u128>,
         coinbase_value: u64,
     ) -> Result<Vec<OutputPair>, ValidationError> {
-        // Stored shares may predate the header gate, so payout reconstruction
-        // must reject an excessive cut rather than reaching the subtraction.
-        Self::validate_donation_and_fee(share_header)?;
         if address_difficulty_map.is_empty() {
             return Err(ValidationError::consensus(
                 "Can't build output from empty distribution. There should be at least one payout address",
@@ -1033,13 +1039,15 @@ impl DefaultShareValidator {
             Amount::from_sat(coinbase_value),
             &share_header.donation_address,
             share_header.donation,
-        );
+        )
+        .map_err(|error| ValidationError::consensus(format!("Invalid donation: {error}")))?;
         let remaining_after_fees = include_address_and_cut(
             &mut distribution,
             remaining_after_donation,
             &share_header.fee_address,
             share_header.fee,
-        );
+        )
+        .map_err(|error| ValidationError::consensus(format!("Invalid fee: {error}")))?;
 
         append_proportional_distribution(
             address_difficulty_map,
@@ -3936,6 +3944,26 @@ mod tests {
     }
 
     #[test]
+    fn test_build_expected_outputs_rejects_fee_above_maximum() {
+        let mut header = TestShareBlockBuilder::new().build().header;
+        header.fee_address = Some(crate::test_utils::parse_address_from_string(
+            "bc1q34aq5drpuwy3wgl9lhup9892qp6svr8ldzyy7c",
+        ));
+        header.fee = Some(10_001);
+        let miner = crate::test_utils::parse_address_from_string(
+            "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
+        );
+        let difficulty_map = HashMap::from([(miner, 1000u128)]);
+
+        let error =
+            DefaultShareValidator::build_expected_outputs(&header, &difficulty_map, 5_000_000_000)
+                .unwrap_err();
+
+        assert_eq!(error.kind(), FailureKind::Consensus);
+        assert!(error.to_string().contains("fee"), "got: {error}");
+    }
+
+    #[test]
     fn test_build_expected_outputs_empty_distribution_returns_error() {
         let header = TestShareBlockBuilder::new()
             .miner_pubkey("020202020202020202020202020202020202020202020202020202020202020202")
@@ -4739,23 +4767,14 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_header_minimum_difficulty_does_not_reject_maximum_cuts() {
+    fn test_validate_donation_and_fee_accepts_maximum_cuts() {
         let mut header = TestShareBlockBuilder::new().build().header;
         header.donation = Some(10_000);
         header.fee = Some(10_000);
 
-        let error = validator()
-            .validate_header_minimum_difficulty(&header)
-            .unwrap_err();
+        let result = DefaultShareValidator::validate_donation_and_fee(&header);
 
-        // The synthetic header still fails its target check, which shows the
-        // cut check accepted exactly 100%.
-        assert!(
-            error
-                .to_string()
-                .contains("easier than maximum pool target"),
-            "unexpected error: {error}"
-        );
+        assert!(result.is_ok(), "got: {result:?}");
     }
 
     #[test]

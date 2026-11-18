@@ -970,13 +970,15 @@ mod tests {
                     .sum(),
                 &header.donation_address,
                 header.donation,
-            );
+            )
+            .unwrap_or_else(|error| panic!("Block {index}: invalid donation: {error}"));
             let remaining_after_fees = include_address_and_cut(
                 &mut outputs,
                 remaining_after_donation,
                 &header.fee_address,
                 header.fee,
-            );
+            )
+            .unwrap_or_else(|error| panic!("Block {index}: invalid fee: {error}"));
             append_proportional_distribution(
                 &address_difficulty_map,
                 remaining_after_fees,

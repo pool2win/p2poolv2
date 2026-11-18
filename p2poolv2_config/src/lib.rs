@@ -63,8 +63,9 @@ const MAX_POOL_SIGNATURE_LENGTH: usize = 16;
 
 /// Maximum donation or fee cut, in basis points (100%).
 ///
-/// This crate does not depend on p2poolv2_lib, so the bound is repeated here.
-const MAX_CUT_BASIS_POINTS: u16 = 10_000;
+/// Also used in p2poolv2_lib, which bounds share header cuts and the
+/// payout arithmetic with the same value.
+pub const MAX_CUT_BASIS_POINTS: u16 = 10_000;
 
 /// Pool operating mode.
 ///
