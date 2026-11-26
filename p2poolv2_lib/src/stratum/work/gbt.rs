@@ -72,9 +72,6 @@ fn compute_merkle_branches(input_txids: Vec<sha256d::Hash>) -> Vec<sha256d::Hash
 
 /// Get a new blocktemplate from the bitcoind server
 /// Parse the received JSON into a BlockTemplate struct and return it.
-///
-/// Returns an error, and so mines nothing on the template, when the template
-/// requires a rule (`!` prefix) that P2Poolv2 does not implement.
 #[instrument(level = "debug", skip(bitcoind))]
 async fn get_block_template(
     bitcoind: &BitcoindRpcClient,
@@ -83,10 +80,7 @@ async fn get_block_template(
     match bitcoind.getblocktemplate(network).await {
         Ok(blocktemplate_json) => {
             match serde_json::from_str::<BlockTemplate>(blocktemplate_json.as_str()) {
-                Ok(template) => {
-                    template.check_required_rules()?;
-                    Ok(template)
-                }
+                Ok(template) => Ok(template),
                 Err(e) => Err(Box::new(WorkError {
                     message: e.to_string(),
                 })),
@@ -98,10 +92,50 @@ async fn get_block_template(
     }
 }
 
-/// Start a task to fetch block templates from bitcoind
+/// Fetch a block template from bitcoind and send it to the notifier.
+///
+/// Returns `Ok(true)` when a template was fetched and `Ok(false)` when the
+/// fetch failed. A failed fetch is logged and left to the next poll or ZMQ
+/// notification, because bitcoind being unreachable or busy passes on its own.
+///
+/// Returns an error when the template requires a rule (`!` prefix) that
+/// P2Poolv2 does not implement. That does not pass on its own: every later
+/// template requires the same rule, and the notifier would keep handing miners
+/// the last template that passed, on a previousblockhash bitcoin has moved
+/// past.
+async fn fetch_and_send_template(
+    bitcoind: &BitcoindRpcClient,
+    network: bitcoin::Network,
+    result_tx: &NotifySender,
+) -> Result<bool, WorkError> {
+    let template = match get_block_template(bitcoind, network).await {
+        Ok(template) => template,
+        Err(error) => {
+            error!("Error getting block template: {error}");
+            return Ok(false);
+        }
+    };
+    template.check_required_rules()?;
+    if result_tx
+        .send(NotifyCmd::SendToAll {
+            template: Arc::new(template),
+        })
+        .await
+        .is_err()
+    {
+        error!("Failed to send block template to channel");
+    }
+    Ok(true)
+}
+
+/// Fetch block templates from bitcoind and send them to the notifier.
 ///
 /// Listen to zmqpubhashblock from bitcoind.
 /// Otherwise, poll for new block templates every poll_interval seconds.
+///
+/// Runs until the ZMQ channel closes, then returns Ok. Returns an error when
+/// the bitcoind client cannot be built, or when a template requires a rule
+/// P2Poolv2 does not implement; the node shuts down on either error.
 pub async fn start_gbt(
     bitcoin_config: BitcoinRpcConfig,
     result_tx: NotifySender,
@@ -129,67 +163,32 @@ pub async fn start_gbt(
         debug!("Bitcoin network difficulty: {}", difficulty);
     }
 
-    tokio::spawn(async move {
-        // first tick will happen instantly
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(poll_interval));
-        // avoid spamming if it is taking longer than [poll_internal]
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // first tick will happen instantly
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(poll_interval));
+    // avoid spamming if it is taking longer than [poll_internal]
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    match get_block_template(&bitcoind, network).await {
-                        Ok(template) => {
-                            if result_tx
-                                .send(NotifyCmd::SendToAll {
-                                    template: Arc::new(template),
-                                })
-                                .await
-                                .is_err()
-                            {
-                                error!("Failed to send block template to channel");
-                            }
-                        }
-                        Err(e) => {
-                            error!("Error polling block template: {}", e);
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                fetch_and_send_template(&bitcoind, network, &result_tx).await?;
+            }
+            result = zmq_trigger_rx.recv() => {
+                match result {
+                    Some(_) => {
+                        debug!("Received ZMQ block notification");
+                        if fetch_and_send_template(&bitcoind, network, &result_tx).await? {
+                            interval.reset();
                         }
                     }
-                }
-                result = zmq_trigger_rx.recv() => {
-                    match result {
-                        Some(_) => {
-                            debug!("Received ZMQ block notification");
-                            match get_block_template(&bitcoind, network).await {
-                                Ok(template) => {
-                                    if result_tx
-                                        .send(NotifyCmd::SendToAll {
-                                            template: Arc::new(template),
-                                        })
-                                        .await
-                                        .is_err()
-                                    {
-                                        error!("Failed to send block template to channel");
-                                    }
-                                    interval.reset();
-                                }
-                                Err(e) => {
-                                    error!(
-                                        "Error getting block template after ZMQ notification: {}",
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                        None => {
-                            debug!("ZMQ channel closed, stopping GBT task");
-                            break;
-                        }
+                    None => {
+                        debug!("ZMQ channel closed, stopping GBT task");
+                        return Ok(());
                     }
                 }
             }
         }
-    });
-    Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -439,16 +438,13 @@ mod gbt_server_tests {
         let (template_tx, mut template_rx) = mpsc::channel(10);
 
         // Start GBT server
-        let result = start_gbt(
+        tokio::spawn(start_gbt(
             bitcoinrpc_config,
             template_tx,
             1,
             bitcoin::Network::Signet,
             zmq_trigger_rx,
-        )
-        .await;
-
-        assert!(result.is_ok());
+        ));
 
         // We should receive a template after a second, but we wait for 2 seconds to ensure it is received
         let timeout =
@@ -493,18 +489,13 @@ mod gbt_server_tests {
         let (template_tx, mut template_rx) = mpsc::channel(10);
 
         // Start GBT server
-        let result = start_gbt(
+        tokio::spawn(start_gbt(
             bitcoinrpc_config,
             template_tx,
             60,
             bitcoin::Network::Signet,
             zmq_trigger_rx,
-        )
-        .await;
-
-        println!("Result: {result:?}");
-
-        assert!(result.is_ok());
+        ));
 
         // send message from ZMQ server
         zmq_trigger_tx.send(()).await.unwrap();
@@ -519,5 +510,63 @@ mod gbt_server_tests {
             panic!("Expected SendToAll");
         };
         assert_eq!(template.height, 108);
+    }
+
+    /// A template that requires a rule P2Poolv2 does not implement stops the
+    /// fetcher with an error, which the node turns into a shutdown, instead of
+    /// leaving miners on the last template that passed the check.
+    #[tokio::test]
+    async fn test_start_gbt_returns_error_on_unsupported_required_rule() {
+        //* bitcoind serves the signet fixture with a required rule we do not know
+        let mut template: serde_json::Value =
+            serde_json::from_str(GBT_NO_TRANSACTIONS_FIXTURE).unwrap();
+        template["rules"] =
+            serde_json::json!(["csv", "!segwit", "!signet", "taproot", "!futurerule"]);
+
+        let (mock_server, bitcoinrpc_config) = setup_mock_bitcoin_rpc().await;
+        let params = serde_json::json!([{
+            "capabilities": ["coinbasetxn", "coinbase/append", "workid"],
+            "rules": ["segwit", "signet", "consensuscleanup"],
+        }]);
+        mock_method(
+            &mock_server,
+            "getblocktemplate",
+            params,
+            template.to_string(),
+        )
+        .await;
+        mock_method(
+            &mock_server,
+            "getdifficulty",
+            serde_json::json!([]),
+            "1".into(),
+        )
+        .await;
+
+        let (_zmq_trigger_tx, zmq_trigger_rx) = mpsc::channel(1);
+        let (template_tx, mut template_rx) = mpsc::channel(10);
+
+        //* The first poll tick fires at once, so start_gbt returns on the first template
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            start_gbt(
+                bitcoinrpc_config,
+                template_tx,
+                1,
+                bitcoin::Network::Signet,
+                zmq_trigger_rx,
+            ),
+        )
+        .await
+        .expect("start_gbt should return instead of running on");
+
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Block template requires unsupported rules: futurerule"
+        );
+
+        //* The rejected template never reached the notifier
+        assert!(template_rx.try_recv().is_err());
     }
 }

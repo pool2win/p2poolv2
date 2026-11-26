@@ -216,7 +216,7 @@ pub async fn build_node(config: Config) -> Result<(NodeHandles, NodeRunner), Exi
     tokio::task::spawn_blocking(move || {
         store_writer.run();
         if *exit_receiver_store.borrow() == ShutdownReason::None {
-            tracing::error!("Store writer stopped unexpectedly");
+            error!("Store writer stopped unexpectedly");
             let _ = exit_sender_store.send(ShutdownReason::Error);
         }
     });
@@ -302,7 +302,7 @@ pub async fn build_node(config: Config) -> Result<(NodeHandles, NodeRunner), Exi
         .await
             && *exit_receiver_gbt.borrow() == ShutdownReason::None
         {
-            tracing::error!("Block template setup failed. Shutting down. \n {e}");
+            error!("Block template fetcher failed. Shutting down. \n {e}");
             let _ = exit_sender_gbt.send(ShutdownReason::Error);
         }
     });
